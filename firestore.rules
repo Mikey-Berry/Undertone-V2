@@ -1,0 +1,69 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function myGroup() { return get(/databases/$(database)/documents/users/$(me())).data.groupId; }
+    function inGroup(gid) { return gid is string && me() in get(/databases/$(database)/documents/groups/$(gid)).data.members; }
+    function count(n) { return n is int && n >= 0; }
+    function shortText(s, max) { return s is string && s.size() <= max; }
+
+    // Each reader's own account, reading days, and progress. Only they can see or change it.
+    match /users/{uid} {
+      allow read, write: if signedIn() && me() == uid;
+      match /{sub=**} {
+        allow read, write: if signedIn() && me() == uid;
+      }
+    }
+
+    // The small public card shown on the group board. Other members draw it on their
+    // screens, so every field must be the type the app expects.
+    match /publicProfiles/{uid} {
+      function validProfile(d) {
+        return d.keys().hasOnly(['name', 'groupId', 'streak', 'longest', 'xp', 'lastDate', 'weekKey', 'weekChapters', 'todayReads'])
+          && (!('name' in d) || shortText(d.name, 40))
+          && (!('groupId' in d) || d.groupId == null || shortText(d.groupId, 6))
+          && (!('streak' in d) || count(d.streak))
+          && (!('longest' in d) || count(d.longest))
+          && (!('xp' in d) || count(d.xp))
+          && (!('lastDate' in d) || d.lastDate == null || shortText(d.lastDate, 10))
+          && (!('weekKey' in d) || d.weekKey == null || shortText(d.weekKey, 10))
+          && (!('weekChapters' in d) || count(d.weekChapters))
+          && (!('todayReads' in d) || (d.todayReads is map && d.todayReads.list is list && d.todayReads.list.size() <= 20));
+      }
+      allow write: if signedIn() && me() == uid && validProfile(request.resource.data);
+      allow read: if signedIn() && (me() == uid || (resource.data.groupId != null && resource.data.groupId == myGroup() && inGroup(myGroup())));
+    }
+
+    match /groups/{gid} {
+      // A group can be opened by its code (that's how joining works), but never listed,
+      // so nobody can browse other groups' codes.
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn() && request.resource.data.owner == me() && request.resource.data.members == [me()]
+        && shortText(request.resource.data.name, 40);
+      // The owner can edit the group; anyone else can only add or remove themselves.
+      allow update: if signedIn() && request.resource.data.members.size() <= 50 && (
+        resource.data.owner == me() ||
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['members']) && (
+          request.resource.data.members.toSet().difference(resource.data.members.toSet()) == [me()].toSet() ||
+          resource.data.members.toSet().difference(request.resource.data.members.toSet()) == [me()].toSet()
+        ))
+      );
+
+      match /feed/{postId} {
+        allow read: if signedIn() && inGroup(gid);
+        allow create: if signedIn() && inGroup(gid)
+          && request.resource.data.keys().hasOnly(['uid', 'name', 'b', 'c', 'text', 'date', 'createdAt'])
+          && request.resource.data.uid == me()
+          && shortText(request.resource.data.name, 40)
+          && request.resource.data.b is int && request.resource.data.b >= 0 && request.resource.data.b <= 65
+          && request.resource.data.c is int && request.resource.data.c >= 1 && request.resource.data.c <= 150
+          && shortText(request.resource.data.text, 280)
+          && shortText(request.resource.data.date, 10)
+          && request.resource.data.createdAt == request.time;
+        allow delete: if signedIn() && resource.data.uid == me();
+      }
+    }
+  }
+}
